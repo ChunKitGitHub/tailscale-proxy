@@ -14,8 +14,15 @@ TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}"
 PROXY_PORT="${PROXY_PORT:-1080}"
 GOST_IMAGE="${GOST_IMAGE:-gogost/gost}"
 CONTAINER_NAME="${CONTAINER_NAME:-proxy_socks5}"
-# GCP Spot 建议设置，例如：gcp-socks。Windows 端随后使用其 MagicDNS 名称连接。
+# 留空时自动读取 GCP 实例名；也可通过环境变量显式覆盖。
 TAILSCALE_HOSTNAME="${TAILSCALE_HOSTNAME:-}"
+# 中心地址可传 https://host 或完整的 wss://host/ws/agent；Token 不写入脚本。
+REGISTRY_URL="${REGISTRY_URL:-}"
+REGISTRY_AGENT_TOKEN="${REGISTRY_AGENT_TOKEN:-}"
+HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-30}"
+HEARTBEAT_ENABLED=0
+# 可覆盖为私有 Release、固定版本 URL 或镜像 URL。
+AGENT_BINARY_URL="${AGENT_BINARY_URL:-}"
 
 SERVICE_NAME="tailscale-socks5"
 CONFIG_DIR="/etc/${SERVICE_NAME}"
@@ -24,6 +31,10 @@ RUNNER_PATH="/usr/local/sbin/${SERVICE_NAME}-start"
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 STATE_DIR="/var/lib/${SERVICE_NAME}"
 STATE_FILE="${STATE_DIR}/install-state"
+HEARTBEAT_CONFIG_FILE="${CONFIG_DIR}/heartbeat.env"
+HEARTBEAT_RUNNER_PATH="/usr/local/bin/spot-agent"
+HEARTBEAT_UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}-heartbeat.service"
+HEARTBEAT_SERVICE="${SERVICE_NAME}-heartbeat"
 
 # 仅在本脚本实际安装了依赖时设为 1；uninstall.sh 会据此避免删除用户原有服务。
 TAILSCALE_INSTALLED_BY_SCRIPT=0
@@ -55,6 +66,83 @@ validate_config() {
         [[ "${TAILSCALE_HOSTNAME}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] \
             || die 'TAILSCALE_HOSTNAME 只能包含字母、数字和连字符，且不能以连字符开头或结尾。'
     fi
+    case "${HEARTBEAT_INTERVAL}" in
+        ''|*[!0-9]*) die "HEARTBEAT_INTERVAL 必须是 10 到 3600 之间的秒数" ;;
+    esac
+    (( HEARTBEAT_INTERVAL >= 10 && HEARTBEAT_INTERVAL <= 3600 )) || die "HEARTBEAT_INTERVAL 必须是 10 到 3600 之间的秒数"
+}
+
+configure_heartbeat() {
+    if { [ -z "${REGISTRY_URL}" ] || [ -z "${REGISTRY_AGENT_TOKEN}" ]; } && [ -r /dev/tty ]; then
+        if [ -z "${REGISTRY_URL}" ]; then
+            printf '请输入 Spot 中心地址（例如 https://aplat.tail0ab388.ts.net）：' >/dev/tty
+            IFS= read -r REGISTRY_URL </dev/tty || true
+        fi
+        if [ -z "${REGISTRY_AGENT_TOKEN}" ]; then
+            printf '请输入 Spot Agent Token（输入不会显示）：' >/dev/tty
+            IFS= read -r -s REGISTRY_AGENT_TOKEN </dev/tty || true
+            printf '\n' >/dev/tty
+        fi
+    fi
+
+    if [ -z "${REGISTRY_URL}" ] || [ -z "${REGISTRY_AGENT_TOKEN}" ]; then
+        if [ -f "${HEARTBEAT_CONFIG_FILE}" ]; then
+            log 'INFO' '未提供中心配置，保留已安装的 Spot 心跳服务。'
+        else
+            log 'WARN' '未提供 REGISTRY_URL 和 REGISTRY_AGENT_TOKEN，本次仅部署 SOCKS5，不启用节点心跳。'
+        fi
+        return
+    fi
+
+    REGISTRY_URL="${REGISTRY_URL%/}"
+    case "${REGISTRY_URL}" in
+        https://*) REGISTRY_URL="wss://${REGISTRY_URL#https://}" ;;
+        http://*) REGISTRY_URL="ws://${REGISTRY_URL#http://}" ;;
+        ws://*|wss://*) ;;
+        *) die 'REGISTRY_URL 必须以 https://、http://、wss:// 或 ws:// 开头。' ;;
+    esac
+    case "${REGISTRY_URL}" in
+        */ws/agent) ;;
+        *) REGISTRY_URL="${REGISTRY_URL}/ws/agent" ;;
+    esac
+    HEARTBEAT_ENABLED=1
+}
+
+get_machine_hostname() {
+    local name=''
+
+    # 在 GCP 上优先使用实例模板生成的实例名；这比镜像内的 hostname 更可靠。
+    if command -v curl >/dev/null 2>&1; then
+        name="$(curl --silent --show-error --connect-timeout 1 --max-time 2 \
+            -H 'Metadata-Flavor: Google' \
+            'http://metadata.google.internal/computeMetadata/v1/instance/name' 2>/dev/null || true)"
+    fi
+    if [ -z "${name}" ]; then
+        name="$(hostname -s 2>/dev/null || hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || true)"
+    fi
+
+    name="${name%%.*}"
+    name="${name// /-}"
+    printf '%s\n' "${name}"
+}
+
+sanitize_dns_label() {
+    local label="$1"
+
+    label="$(printf '%s' "${label}" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g' \
+        | cut -c1-63 \
+        | sed -E 's/-+$//')"
+    [ -n "${label}" ] || label="tailscale-$(date +%s)"
+    printf '%s\n' "${label}"
+}
+
+resolve_tailscale_hostname() {
+    if [ -z "${TAILSCALE_HOSTNAME}" ]; then
+        TAILSCALE_HOSTNAME="$(sanitize_dns_label "$(get_machine_hostname)")"
+    fi
+    log 'INFO' "Tailscale 主机名：${TAILSCALE_HOSTNAME}"
 }
 
 install_curl_if_needed() {
@@ -240,8 +328,54 @@ write_install_state() {
     chmod 0600 "${STATE_FILE}"
 }
 
+install_heartbeat_agent() {
+    local architecture download_url temp_file
+
+    [ "${HEARTBEAT_ENABLED}" -eq 1 ] || return
+    log '7/7' '正在安装并启动 Spot 节点心跳…'
+    case "$(uname -m)" in
+        x86_64|amd64) architecture='amd64' ;;
+        aarch64|arm64) architecture='arm64' ;;
+        *) die "不支持的 CPU 架构：$(uname -m)" ;;
+    esac
+    download_url="${AGENT_BINARY_URL:-https://github.com/ChunKitGitHub/tailscale-proxy/releases/latest/download/spot-agent-linux-${architecture}}"
+    temp_file="$(mktemp)"
+    trap 'rm -f "${temp_file}"' RETURN
+    curl --fail --show-error --silent --location "${download_url}" --output "${temp_file}"
+    install -m 0755 "${temp_file}" "${HEARTBEAT_RUNNER_PATH}"
+    install -d -m 0755 "${CONFIG_DIR}"
+    {
+        printf 'REGISTRY_WS_URL=%s\n' "${REGISTRY_URL}"
+        printf 'REGISTRY_AGENT_TOKEN=%s\n' "${REGISTRY_AGENT_TOKEN}"
+        printf 'PROXY_PORT=%s\n' "${PROXY_PORT}"
+        printf 'TAILSCALE_HOSTNAME=%s\n' "${TAILSCALE_HOSTNAME}"
+        printf 'HEARTBEAT_INTERVAL=%s\n' "${HEARTBEAT_INTERVAL}"
+    } >"${HEARTBEAT_CONFIG_FILE}"
+    chmod 0600 "${HEARTBEAT_CONFIG_FILE}"
+    cat >"${HEARTBEAT_UNIT_PATH}" <<EOF
+[Unit]
+Description=Spot Registry heartbeat for Tailscale SOCKS5 node
+Wants=network-online.target tailscaled.service ${SERVICE_NAME}.service
+After=network-online.target tailscaled.service ${SERVICE_NAME}.service
+
+[Service]
+Type=simple
+EnvironmentFile=${HEARTBEAT_CONFIG_FILE}
+ExecStart=${HEARTBEAT_RUNNER_PATH}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now "${HEARTBEAT_SERVICE}.service"
+    rm -f "${temp_file}"
+    trap - RETURN
+}
+
 write_runtime_files() {
-    log '5/6' '正在配置重启后自动恢复的 systemd 服务…'
+    log '5/7' '正在配置重启后自动恢复的 systemd 服务…'
     install -d -m 0755 "${CONFIG_DIR}"
 
     # %q 让 config 即使包含空格等字符也能被 bash 安全地 source。
@@ -309,7 +443,7 @@ EOF
 start_proxy() {
     local ts_ip
 
-    log '6/6' '正在启动 SOCKS5 代理…'
+    log '6/7' '正在启动 SOCKS5 代理…'
     systemctl restart "${SERVICE_NAME}.service"
     ts_ip="$(wait_for_tailscale_ip)" || die '代理启动后未能获取 Tailscale IPv4 地址。'
 
@@ -326,12 +460,15 @@ main() {
     validate_config
     ensure_systemd
     install_curl_if_needed
+    configure_heartbeat
+    resolve_tailscale_hostname
     ensure_tailscale
     connect_tailscale
     ensure_docker
     write_install_state
     write_runtime_files
     start_proxy
+    install_heartbeat_agent
 }
 
 main "$@"

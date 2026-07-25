@@ -15,6 +15,9 @@ RUNNER_PATH="/usr/local/sbin/${SERVICE_NAME}-start"
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 STATE_DIR="/var/lib/${SERVICE_NAME}"
 STATE_FILE="${STATE_DIR}/install-state"
+HEARTBEAT_SERVICE="${SERVICE_NAME}-heartbeat"
+HEARTBEAT_UNIT_PATH="/etc/systemd/system/${HEARTBEAT_SERVICE}.service"
+HEARTBEAT_RUNNER_PATH='/usr/local/bin/spot-agent'
 
 CONTAINER_NAME='proxy_socks5'
 GOST_IMAGE='gogost/gost'
@@ -59,8 +62,19 @@ load_install_state() {
     fi
 }
 
+remove_heartbeat_service() {
+    log '1/5' '正在停止并删除 Spot 节点心跳服务…'
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now "${HEARTBEAT_SERVICE}.service" >/dev/null 2>&1 || true
+    fi
+    rm -f "${HEARTBEAT_UNIT_PATH}" "${HEARTBEAT_RUNNER_PATH}"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload
+    fi
+}
+
 remove_proxy_service() {
-    log '1/4' '正在停止并删除 SOCKS5 代理服务…'
+    log '2/5' '正在停止并删除 SOCKS5 代理服务…'
 
     if command -v systemctl >/dev/null 2>&1; then
         systemctl disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
@@ -108,11 +122,11 @@ remove_package_if_present() {
 
 remove_tailscale() {
     if [ "${TAILSCALE_INSTALLED_BY_SCRIPT}" != '1' ] && [ "${PURGE_DEPENDENCIES}" != '1' ]; then
-        log '2/4' 'Tailscale 不是本脚本安装，已保留。'
+        log '3/5' 'Tailscale 不是本脚本安装，已保留。'
         return
     fi
 
-    log '2/4' '正在卸载 Tailscale…'
+    log '3/5' '正在卸载 Tailscale…'
     if command -v systemctl >/dev/null 2>&1; then
         systemctl disable --now tailscaled >/dev/null 2>&1 || true
     fi
@@ -124,7 +138,7 @@ remove_docker() {
     local remaining_containers
 
     if [ "${DOCKER_INSTALLED_BY_SCRIPT}" != '1' ] && [ "${PURGE_DEPENDENCIES}" != '1' ]; then
-        log '3/4' 'Docker 不是本脚本安装，已保留。'
+        log '4/5' 'Docker 不是本脚本安装，已保留。'
         return
     fi
 
@@ -133,7 +147,7 @@ remove_docker() {
         [ -z "${remaining_containers}" ] || die 'Docker 中仍有其他容器；为避免误删，未卸载 Docker。请先处理这些容器后重试。'
     fi
 
-    log '3/4' '正在卸载 Docker…'
+    log '4/5' '正在卸载 Docker…'
     if command -v systemctl >/dev/null 2>&1; then
         systemctl disable --now docker >/dev/null 2>&1 || true
         systemctl disable --now containerd >/dev/null 2>&1 || true
@@ -153,7 +167,7 @@ remove_docker() {
 }
 
 remove_state() {
-    log '4/4' '正在删除本项目的安装记录…'
+    log '5/5' '正在删除本项目的安装记录…'
     rm -rf "${STATE_DIR}"
     log 'DONE' '代理及本脚本安装的依赖已卸载完成。'
 }
@@ -162,6 +176,7 @@ main() {
     parse_args "${1:-}"
     require_root
     load_install_state
+    remove_heartbeat_service
     remove_proxy_service
     remove_tailscale
     remove_docker

@@ -178,7 +178,9 @@ EOF
 configure_firewall_include() {
     command -v uci >/dev/null 2>&1 || die '未找到 UCI，当前系统不是标准 OpenWrt/ImmortalWrt。'
 
-    uci -q delete "firewall.${FIREWALL_INCLUDE}"
+    # 首次安装时该 section 不存在；-q 只是不输出错误，仍会返回非零。
+    # 必须显式忽略这个预期结果，才能继续创建 include。
+    uci -q delete "firewall.${FIREWALL_INCLUDE}" || true
     uci set "firewall.${FIREWALL_INCLUDE}=include"
     if [ "${FIREWALL_BACKEND}" = 'nft' ]; then
         uci set "firewall.${FIREWALL_INCLUDE}.type=nftables"

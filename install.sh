@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 在 Debian / Ubuntu 等使用 systemd 的 GCP VM 上安装 Tailscale SOCKS5 代理。
 #
-# 首次运行（请使用新的、可复用的 Tailscale Auth Key）：
-#   sudo env TAILSCALE_AUTH_KEY='tskey-auth-...' bash install.sh
+# 首次运行可直接执行脚本；若本机尚未加入 Tailnet，脚本会在终端提示输入 Auth Key。
+# 无交互的 GCP 启动脚本请使用：env TAILSCALE_AUTH_KEY='tskey-auth-...' bash install.sh
 #
 # 已加入 Tailnet 的机器可以直接再次运行；此时不需要再提供 Auth Key。
 # 重启后由 tailscale-socks5.service 等待 Tailscale IP 可用，再启动容器。
@@ -136,7 +136,13 @@ connect_tailscale() {
         return
     fi
 
-    [ -n "${TAILSCALE_AUTH_KEY}" ] || die '本机尚未加入 Tailnet。请设置 TAILSCALE_AUTH_KEY 后重试。'
+    if [ -z "${TAILSCALE_AUTH_KEY}" ] && [ -r /dev/tty ]; then
+        # curl | bash 时标准输入被脚本内容占用，必须从控制终端读取密钥。
+        printf '请输入 Tailscale Auth Key（输入不会显示）：' >/dev/tty
+        IFS= read -r -s TAILSCALE_AUTH_KEY </dev/tty || true
+        printf '\n' >/dev/tty
+    fi
+    [ -n "${TAILSCALE_AUTH_KEY}" ] || die '本机尚未加入 Tailnet。请在交互终端输入 Auth Key，或设置 TAILSCALE_AUTH_KEY 后重试。'
     log '3/6' '正在使用 Auth Key 加入 Tailscale…'
     up_args=(up "--auth-key=${TAILSCALE_AUTH_KEY}")
     if [ -n "${TAILSCALE_HOSTNAME}" ]; then

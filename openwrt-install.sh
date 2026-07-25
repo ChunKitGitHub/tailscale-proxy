@@ -15,6 +15,7 @@ PATH='/usr/sbin:/usr/bin:/sbin:/bin'
 FIREWALL_SCRIPT='/etc/firewall.tailscale-forwarding'
 FIREWALL_INCLUDE='tailscale_forwarding'
 TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}"
+FORCE_TAILSCALE_RELOGIN="${FORCE_TAILSCALE_RELOGIN:-0}"
 
 log() {
     printf '[%s] %s\n' "$1" "$2"
@@ -81,6 +82,19 @@ read_auth_key() {
     [ -n "${TAILSCALE_AUTH_KEY}" ] || die 'Auth Key 不能为空。'
 }
 
+should_relogin() {
+    [ "${FORCE_TAILSCALE_RELOGIN}" = '1' ] && return 0
+    [ -r /dev/tty ] || return 1
+
+    printf '检测到已有 Tailscale 身份。是否用新的 Auth Key 重新注册此设备？[y/N] ' >/dev/tty
+    answer=''
+    IFS= read -r answer </dev/tty || true
+    case "${answer}" in
+        y|Y|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 connect_tailscale() {
     # 清除旧教程遗留的错误路由广播。tailscale set 只修改这一项偏好，
     # 不需要 --reset，也不会覆盖用户其他 Tailscale 设置。
@@ -91,7 +105,12 @@ connect_tailscale() {
 
     if tailscale ip -4 >/dev/null 2>&1; then
         log '3/6' "Tailscale 已连接，IP: $(tailscale ip -4 | sed -n '1p')"
-        return
+        if ! should_relogin; then
+            log 'INFO' '保留现有 Tailscale 身份。'
+            return
+        fi
+        log 'INFO' '正在退出旧 Tailnet 身份并重新注册…'
+        tailscale logout
     fi
 
     read_auth_key

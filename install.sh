@@ -29,6 +29,7 @@ STATE_FILE="${STATE_DIR}/install-state"
 TAILSCALE_INSTALLED_BY_SCRIPT=0
 DOCKER_INSTALLED_BY_SCRIPT=0
 DOCKER_INSTALL_METHOD=''
+DOCKER_SERVICE=''
 
 log() {
     printf '[%s] %s\n' "$1" "$2"
@@ -163,20 +164,55 @@ install_docker_from_packages() {
     fi
 }
 
+detect_docker_service() {
+    local unit
+
+    # Snap 版 Docker 的服务名不同；其余常见发行版使用 docker.service。
+    for unit in docker.service snap.docker.dockerd.service; do
+        if systemctl cat "${unit}" >/dev/null 2>&1; then
+            printf '%s\n' "${unit}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 ensure_docker() {
-    if ! command -v docker >/dev/null 2>&1; then
-        log '4/6' '未检测到 Docker，尝试通过系统软件源安装…'
+    local docker_was_present=0
+
+    command -v docker >/dev/null 2>&1 && docker_was_present=1
+    DOCKER_SERVICE="$(detect_docker_service || true)"
+
+    if [ "${docker_was_present}" -eq 0 ] || [ -z "${DOCKER_SERVICE}" ]; then
+        log '4/6' '未检测到可由 systemd 管理的 Docker Engine，尝试通过系统软件源安装…'
         if ! install_docker_from_packages; then
             log 'WARN' '系统软件源未提供 Docker，改用 Docker 官方安装脚本。'
             run_downloaded_script 'https://get.docker.com' 'Docker'
             DOCKER_INSTALL_METHOD='official'
         fi
-        DOCKER_INSTALLED_BY_SCRIPT=1
+        DOCKER_SERVICE="$(detect_docker_service || true)"
+
+        # 某些镜像带有 docker 客户端（或 Podman 兼容命令），但没有 Docker daemon。
+        # 软件源安装后仍没有服务时，尝试 Docker 官方安装器一次。
+        if [ -z "${DOCKER_SERVICE}" ]; then
+            log 'WARN' '系统软件源安装后仍未发现 Docker 服务，改用 Docker 官方安装器。'
+            run_downloaded_script 'https://get.docker.com' 'Docker'
+            DOCKER_INSTALL_METHOD='official'
+            DOCKER_SERVICE="$(detect_docker_service || true)"
+        fi
+
+        [ -n "${DOCKER_SERVICE}" ] || die '检测到 Docker 客户端，但未找到 Docker Engine 服务。请检查是否安装了 Podman 或损坏的 Docker/Snap 安装。'
+        [ "${docker_was_present}" -eq 0 ] && DOCKER_INSTALLED_BY_SCRIPT=1
     else
-        log '4/6' 'Docker 已安装。'
+        log '4/6' "Docker 已安装（服务：${DOCKER_SERVICE}）。"
     fi
 
-    systemctl enable --now docker
+    if [[ "${DOCKER_SERVICE}" == snap.* ]]; then
+        # Snap 服务由 snapd 负责开机启用；部分系统不允许对它执行 systemctl enable。
+        systemctl start "${DOCKER_SERVICE}"
+    else
+        systemctl enable --now "${DOCKER_SERVICE}"
+    fi
     docker info >/dev/null
 }
 
@@ -246,8 +282,8 @@ EOF
     cat >"${UNIT_PATH}" <<EOF
 [Unit]
 Description=Tailscale-bound Gost SOCKS5 proxy
-Wants=network-online.target tailscaled.service docker.service
-After=network-online.target tailscaled.service docker.service
+Wants=network-online.target tailscaled.service ${DOCKER_SERVICE}
+After=network-online.target tailscaled.service ${DOCKER_SERVICE}
 
 [Service]
 Type=oneshot

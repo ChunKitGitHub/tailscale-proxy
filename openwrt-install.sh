@@ -150,19 +150,28 @@ write_firewall_script() {
 
 PATH='/usr/sbin:/usr/bin:/sbin:/bin'
 
-ensure_nft_rule() {
-    chain="$1"
-    marker="$2"
-    shift 2
-    nft list chain inet fw4 "${chain}" 2>/dev/null | grep -F "${marker}" >/dev/null || \
-        nft add rule inet fw4 "${chain}" "$@" comment "\"${marker}\""
+replace_nft_rule() {
+    action="$1"
+    chain="$2"
+    marker="$3"
+    shift 3
+
+    # 旧版脚本将 accept 规则追加在 forward 链末尾，可能落在 fw4 的
+    # 默认 reject 之后。先按 comment 找到并删除旧规则，再按正确位置插入。
+    handles="$(nft -a list chain inet fw4 "${chain}" 2>/dev/null \
+        | sed -n "/${marker}/s/.*# handle \([0-9][0-9]*\).*/\1/p")"
+    for handle in ${handles}; do
+        nft delete rule inet fw4 "${chain}" handle "${handle}"
+    done
+
+    nft "${action}" rule inet fw4 "${chain}" "$@" comment "\"${marker}\""
 }
 
 # 允许 LAN 客户端经 OpenWrt 转发到 Spot 的 Tailscale 地址；
 # MASQUERADE 保证 Spot 的回包返回本 OpenWrt，再由 conntrack 交还 LAN 客户端。
-ensure_nft_rule forward tailscale-forward-in iifname '"tailscale0"' accept
-ensure_nft_rule forward tailscale-forward-out oifname '"tailscale0"' accept
-ensure_nft_rule srcnat tailscale-srcnat oifname '"tailscale0"' masquerade
+replace_nft_rule insert forward tailscale-forward-in iifname '"tailscale0"' accept
+replace_nft_rule insert forward tailscale-forward-out oifname '"tailscale0"' accept
+replace_nft_rule add srcnat tailscale-srcnat oifname '"tailscale0"' masquerade
 EOF
         chmod 0755 "${FIREWALL_SCRIPT}"
         return

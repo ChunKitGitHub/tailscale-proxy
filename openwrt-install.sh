@@ -13,7 +13,6 @@ set -eu
 
 PATH='/usr/sbin:/usr/bin:/sbin:/bin'
 FIREWALL_SCRIPT='/etc/firewall.tailscale-forwarding'
-NFT_FIREWALL_SCRIPT='/etc/nftables.d/90-tailscale-forwarding.nft'
 FIREWALL_INCLUDE='tailscale_forwarding'
 TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}"
 FORCE_TAILSCALE_RELOGIN="${FORCE_TAILSCALE_RELOGIN:-0}"
@@ -140,15 +139,27 @@ connect_tailscale() {
 write_firewall_script() {
     log '4/6' '正在写入持久化 Tailscale 转发规则…'
     if [ "${FIREWALL_BACKEND}" = 'nft' ]; then
-        mkdir -p /etc/nftables.d
-        cat >"${NFT_FIREWALL_SCRIPT}" <<'EOF'
-# 由 openwrt-install.sh 管理。fw4 每次启动/重载时加载本文件。
-# 允许 LAN <-> tailscale0 转发，并对经 tailscale0 离开的 LAN 流量做 NAT。
-add rule inet fw4 forward iifname "tailscale0" accept
-add rule inet fw4 forward oifname "tailscale0" accept
-add rule inet fw4 srcnat oifname "tailscale0" masquerade
+        cat >"${FIREWALL_SCRIPT}" <<'EOF'
+#!/bin/sh
+# 由 openwrt-install.sh 管理。fw4 启动/重载完成后执行本文件。
+
+PATH='/usr/sbin:/usr/bin:/sbin:/bin'
+
+ensure_nft_rule() {
+    chain="$1"
+    marker="$2"
+    shift 2
+    nft list chain inet fw4 "${chain}" 2>/dev/null | grep -F "${marker}" >/dev/null || \
+        nft add rule inet fw4 "${chain}" "$@" comment "\"${marker}\""
+}
+
+# 允许 LAN 客户端经 OpenWrt 转发到 Spot 的 Tailscale 地址；
+# MASQUERADE 保证 Spot 的回包返回本 OpenWrt，再由 conntrack 交还 LAN 客户端。
+ensure_nft_rule forward tailscale-forward-in iifname '"tailscale0"' accept
+ensure_nft_rule forward tailscale-forward-out oifname '"tailscale0"' accept
+ensure_nft_rule srcnat tailscale-srcnat oifname '"tailscale0"' masquerade
 EOF
-        chmod 0644 "${NFT_FIREWALL_SCRIPT}"
+        chmod 0755 "${FIREWALL_SCRIPT}"
         return
     fi
 
@@ -183,9 +194,10 @@ configure_firewall_include() {
     uci -q delete "firewall.${FIREWALL_INCLUDE}" || true
     uci set "firewall.${FIREWALL_INCLUDE}=include"
     if [ "${FIREWALL_BACKEND}" = 'nft' ]; then
-        uci set "firewall.${FIREWALL_INCLUDE}.type=nftables"
-        uci set "firewall.${FIREWALL_INCLUDE}.path=${NFT_FIREWALL_SCRIPT}"
-        uci set "firewall.${FIREWALL_INCLUDE}.position=ruleset-post"
+        # fw4 的 nftables include 是规则集片段，不接受 "nft add rule" 命令。
+        # 用 script include 在 fw4 规则集就绪后执行原生 nft 命令。
+        uci set "firewall.${FIREWALL_INCLUDE}.type=script"
+        uci set "firewall.${FIREWALL_INCLUDE}.path=${FIREWALL_SCRIPT}"
     else
         uci set "firewall.${FIREWALL_INCLUDE}.type=script"
         uci set "firewall.${FIREWALL_INCLUDE}.path=${FIREWALL_SCRIPT}"
@@ -201,7 +213,7 @@ apply_firewall_rules() {
     # firewall 重启可能清理 Tailscale 自己维护的 netfilter 规则，重启一次
     # tailscaled 让它重新写入；身份状态保存在本机，不会要求再次输入 Auth Key。
     /etc/init.d/tailscale restart
-    [ "${FIREWALL_BACKEND}" = 'nft' ] || "${FIREWALL_SCRIPT}"
+    "${FIREWALL_SCRIPT}"
 }
 
 verify() {
@@ -214,7 +226,7 @@ verify() {
 
         printf '\n部署完成。\n'
         printf 'Tailscale IP: %s\n' "$(tailscale ip -4 | sed -n '1p')"
-        printf '重启后规则由 %s 自动恢复。\n' "${NFT_FIREWALL_SCRIPT}"
+        printf '重启后规则由 %s 自动恢复。\n' "${FIREWALL_SCRIPT}"
         printf 'Windows 可通过本 OpenWrt 的默认网关，访问已获授权的 Spot Tailscale IP:1080。\n'
         return
     fi

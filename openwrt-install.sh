@@ -52,6 +52,19 @@ ensure_tailscale() {
     /etc/init.d/tailscale start
 }
 
+update_tailscale() {
+    log '2/6' '正在更新 Tailscale 到可用的最新版本…'
+
+    # tailscale update --yes 等同于交互时确认 y。OpenWrt 的 opkg 版本较旧时，
+    # 由 Tailscale 自更新器下载并替换二进制；失败则保留 opkg 版本继续工作。
+    if tailscale update --yes; then
+        /etc/init.d/tailscale restart
+        log '2/6' "Tailscale 当前版本：$(tailscale version | sed -n '1p')"
+    else
+        log 'WARN' "Tailscale 自更新失败，继续使用 opkg 版本：$(tailscale version | sed -n '1p')"
+    fi
+}
+
 read_auth_key() {
     [ -n "${TAILSCALE_AUTH_KEY}" ] && return
     [ -r /dev/tty ] || die '非交互运行时必须设置 TAILSCALE_AUTH_KEY 环境变量。'
@@ -153,6 +166,7 @@ main() {
     command -v opkg >/dev/null 2>&1 || die '此脚本仅支持 OpenWrt / ImmortalWrt。'
     ensure_iptables
     ensure_tailscale
+    update_tailscale
     connect_tailscale
     write_firewall_script
     configure_firewall_include

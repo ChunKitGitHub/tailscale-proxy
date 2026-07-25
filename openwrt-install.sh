@@ -13,6 +13,7 @@ set -eu
 
 PATH='/usr/sbin:/usr/bin:/sbin:/bin'
 FIREWALL_SCRIPT='/etc/firewall.tailscale-forwarding'
+LEGACY_NFT_FIREWALL_SCRIPT='/etc/nftables.d/90-tailscale-forwarding.nft'
 FIREWALL_INCLUDE='tailscale_forwarding'
 TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}"
 FORCE_TAILSCALE_RELOGIN="${FORCE_TAILSCALE_RELOGIN:-0}"
@@ -138,6 +139,10 @@ connect_tailscale() {
 
 write_firewall_script() {
     log '4/6' '正在写入持久化 Tailscale 转发规则…'
+    # 清理早期版本写入的错误 nftables include；fw4 会自动加载
+    # /etc/nftables.d/*.nft，遗留文件会阻止整个防火墙重载。
+    rm -f "${LEGACY_NFT_FIREWALL_SCRIPT}"
+
     if [ "${FIREWALL_BACKEND}" = 'nft' ]; then
         cat >"${FIREWALL_SCRIPT}" <<'EOF'
 #!/bin/sh

@@ -14,12 +14,21 @@ TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}"
 PROXY_PORT="${PROXY_PORT:-1080}"
 GOST_IMAGE="${GOST_IMAGE:-gogost/gost}"
 CONTAINER_NAME="${CONTAINER_NAME:-proxy_socks5}"
+# GCP Spot 建议设置，例如：gcp-socks。Windows 端随后使用其 MagicDNS 名称连接。
+TAILSCALE_HOSTNAME="${TAILSCALE_HOSTNAME:-}"
 
 SERVICE_NAME="tailscale-socks5"
 CONFIG_DIR="/etc/${SERVICE_NAME}"
 CONFIG_FILE="${CONFIG_DIR}/config"
 RUNNER_PATH="/usr/local/sbin/${SERVICE_NAME}-start"
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+STATE_DIR="/var/lib/${SERVICE_NAME}"
+STATE_FILE="${STATE_DIR}/install-state"
+
+# 仅在本脚本实际安装了依赖时设为 1；uninstall.sh 会据此避免删除用户原有服务。
+TAILSCALE_INSTALLED_BY_SCRIPT=0
+DOCKER_INSTALLED_BY_SCRIPT=0
+DOCKER_INSTALL_METHOD=''
 
 log() {
     printf '[%s] %s\n' "$1" "$2"
@@ -41,6 +50,10 @@ validate_config() {
     (( PROXY_PORT >= 1 && PROXY_PORT <= 65535 )) || die "PROXY_PORT 必须是 1 到 65535 之间的数字"
     [ -n "${GOST_IMAGE}" ] || die "GOST_IMAGE 不能为空"
     [ -n "${CONTAINER_NAME}" ] || die "CONTAINER_NAME 不能为空"
+    if [ -n "${TAILSCALE_HOSTNAME}" ]; then
+        [[ "${TAILSCALE_HOSTNAME}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] \
+            || die 'TAILSCALE_HOSTNAME 只能包含字母、数字和连字符，且不能以连字符开头或结尾。'
+    fi
 }
 
 install_curl_if_needed() {
@@ -81,6 +94,7 @@ ensure_tailscale() {
     if ! command -v tailscale >/dev/null 2>&1; then
         log '2/6' '未检测到 Tailscale，正在安装…'
         run_downloaded_script 'https://tailscale.com/install.sh' 'Tailscale'
+        TAILSCALE_INSTALLED_BY_SCRIPT=1
     else
         log '2/6' 'Tailscale 已安装。'
     fi
@@ -110,16 +124,24 @@ wait_for_tailscale_ip() {
 
 connect_tailscale() {
     local ts_ip
+    local -a up_args
 
     ts_ip="$(current_tailscale_ip)"
     if [ -n "${ts_ip}" ]; then
+        if [ -n "${TAILSCALE_HOSTNAME}" ]; then
+            tailscale set --hostname="${TAILSCALE_HOSTNAME}"
+        fi
         log '3/6' "Tailscale 已连接，IP: ${ts_ip}"
         return
     fi
 
     [ -n "${TAILSCALE_AUTH_KEY}" ] || die '本机尚未加入 Tailnet。请设置 TAILSCALE_AUTH_KEY 后重试。'
     log '3/6' '正在使用 Auth Key 加入 Tailscale…'
-    tailscale up --auth-key="${TAILSCALE_AUTH_KEY}"
+    up_args=(up "--auth-key=${TAILSCALE_AUTH_KEY}")
+    if [ -n "${TAILSCALE_HOSTNAME}" ]; then
+        up_args+=("--hostname=${TAILSCALE_HOSTNAME}")
+    fi
+    tailscale "${up_args[@]}"
 
     ts_ip="$(wait_for_tailscale_ip)" || die '等待 Tailscale IPv4 地址超时，请检查 Auth Key 和出网连接。'
     log '3/6' "成功分配到 Tailscale IP: ${ts_ip}"
@@ -129,10 +151,13 @@ install_docker_from_packages() {
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
+        DOCKER_INSTALL_METHOD='apt'
     elif command -v dnf >/dev/null 2>&1; then
         dnf install -y docker
+        DOCKER_INSTALL_METHOD='dnf'
     elif command -v yum >/dev/null 2>&1; then
         yum install -y docker
+        DOCKER_INSTALL_METHOD='yum'
     else
         return 1
     fi
@@ -144,13 +169,33 @@ ensure_docker() {
         if ! install_docker_from_packages; then
             log 'WARN' '系统软件源未提供 Docker，改用 Docker 官方安装脚本。'
             run_downloaded_script 'https://get.docker.com' 'Docker'
+            DOCKER_INSTALL_METHOD='official'
         fi
+        DOCKER_INSTALLED_BY_SCRIPT=1
     else
         log '4/6' 'Docker 已安装。'
     fi
 
     systemctl enable --now docker
     docker info >/dev/null
+}
+
+write_install_state() {
+    # 重复运行安装脚本时保留首次安装的归属记录，不能因为依赖现在已存在就丢失它。
+    if [ -f "${STATE_FILE}" ]; then
+        grep -Fxq 'TAILSCALE_INSTALLED_BY_SCRIPT=1' "${STATE_FILE}" && TAILSCALE_INSTALLED_BY_SCRIPT=1 || true
+        grep -Fxq 'DOCKER_INSTALLED_BY_SCRIPT=1' "${STATE_FILE}" && DOCKER_INSTALLED_BY_SCRIPT=1 || true
+    fi
+    install -d -m 0700 "${STATE_DIR}"
+    {
+        printf '# 由 install.sh 生成，供 uninstall.sh 判断依赖归属。\n'
+        printf 'TAILSCALE_INSTALLED_BY_SCRIPT=%q\n' "${TAILSCALE_INSTALLED_BY_SCRIPT}"
+        printf 'DOCKER_INSTALLED_BY_SCRIPT=%q\n' "${DOCKER_INSTALLED_BY_SCRIPT}"
+        printf 'DOCKER_INSTALL_METHOD=%q\n' "${DOCKER_INSTALL_METHOD}"
+        printf 'CONTAINER_NAME=%q\n' "${CONTAINER_NAME}"
+        printf 'GOST_IMAGE=%q\n' "${GOST_IMAGE}"
+    } >"${STATE_FILE}"
+    chmod 0600 "${STATE_FILE}"
 }
 
 write_runtime_files() {
@@ -242,6 +287,7 @@ main() {
     ensure_tailscale
     connect_tailscale
     ensure_docker
+    write_install_state
     write_runtime_files
     start_proxy
 }

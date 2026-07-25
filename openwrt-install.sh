@@ -69,6 +69,13 @@ read_auth_key() {
 }
 
 connect_tailscale() {
+    # 清除旧教程遗留的错误路由广播。tailscale set 只修改这一项偏好，
+    # 不需要 --reset，也不会覆盖用户其他 Tailscale 设置。
+    log '3/6' '正在清除旧的 100.64.0.0/10 路由广播（如存在）…'
+    if ! tailscale set --advertise-routes=; then
+        log 'WARN' '当前尚未登录，登录后会再次清除旧路由广播。'
+    fi
+
     if tailscale ip -4 >/dev/null 2>&1; then
         log '3/6' "Tailscale 已连接，IP: $(tailscale ip -4 | sed -n '1p')"
         return
@@ -76,7 +83,9 @@ connect_tailscale() {
 
     read_auth_key
     log '3/6' '正在加入 Tailscale…'
-    tailscale up --authkey="${TAILSCALE_AUTH_KEY}"
+    # login 仅处理身份认证，不会要求把旧 hostname、路由等所有偏好重新列出。
+    tailscale login --auth-key="${TAILSCALE_AUTH_KEY}"
+    tailscale set --advertise-routes=
     tailscale ip -4 >/dev/null 2>&1 || die 'Tailscale 未能获取 IPv4 地址，请检查 Auth Key 和网络。'
     log '3/6' "Tailscale 已连接，IP: $(tailscale ip -4 | sed -n '1p')"
 }

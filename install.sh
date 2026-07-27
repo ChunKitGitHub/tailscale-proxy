@@ -307,7 +307,32 @@ ensure_docker() {
     else
         systemctl enable --now "${DOCKER_SERVICE}"
     fi
-    docker info >/dev/null
+	docker info >/dev/null
+}
+
+ensure_firewall_tools() {
+    if command -v iptables >/dev/null 2>&1 \
+        && command -v iptables-restore >/dev/null 2>&1 \
+        && command -v ip6tables >/dev/null 2>&1 \
+        && command -v ip6tables-restore >/dev/null 2>&1; then
+        return
+    fi
+    log 'INFO' '正在安装 Spot 双栈访问控制所需的 iptables/ip6tables…'
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y iptables
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y iptables
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y iptables
+    else
+        die '未找到 iptables/iptables-restore，且系统没有受支持的软件包管理器。'
+    fi
+    command -v iptables >/dev/null 2>&1 \
+        && command -v iptables-restore >/dev/null 2>&1 \
+        && command -v ip6tables >/dev/null 2>&1 \
+        && command -v ip6tables-restore >/dev/null 2>&1 \
+        || die 'iptables/ip6tables 安装完成后仍不可用，无法启用 Spot 双栈访问控制。'
 }
 
 write_install_state() {
@@ -369,7 +394,8 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now "${HEARTBEAT_SERVICE}.service"
+    systemctl enable "${HEARTBEAT_SERVICE}.service"
+    systemctl restart "${HEARTBEAT_SERVICE}.service"
     rm -f "${temp_file}"
     trap - RETURN
 }
@@ -403,19 +429,22 @@ esac
 # Docker 会在 Tailscale 网络真正就绪前先尝试恢复旧容器；这里显式等待 IP，
 # 再重建容器，避免 "cannot assign requested address" 后永远无法监听的问题。
 for attempt in $(seq 1 60); do
-    TS_IP="$(tailscale ip -4 2>/dev/null | sed -n '1p' || true)"
-    [ -n "${TS_IP}" ] && break
+    TS_IPV4="$(tailscale ip -4 2>/dev/null | sed -n '1p' || true)"
+    TS_IPV6="$(tailscale ip -6 2>/dev/null | sed -n '1p' || true)"
+    [ -n "${TS_IPV4}" ] && [ -n "${TS_IPV6}" ] && break
     sleep 2
 done
-[ -n "${TS_IP:-}" ] || { echo 'Tailscale IPv4 address was not available after 120 seconds' >&2; exit 1; }
+[ -n "${TS_IPV4:-}" ] && [ -n "${TS_IPV6:-}" ] \
+    || { echo 'Tailscale IPv4 and IPv6 addresses were not available after 120 seconds' >&2; exit 1; }
 
 docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
 exec docker run -d \
     --name "${CONTAINER_NAME}" \
     --restart unless-stopped \
-    -p "${TS_IP}:${PROXY_PORT}:1080" \
+    --network host \
     "${GOST_IMAGE}" \
-    -L=socks5://:1080
+    -L="socks5://${TS_IPV4}:${PROXY_PORT}" \
+    -L="socks5://[${TS_IPV6}]:${PROXY_PORT}"
 EOF
     chmod 0755 "${RUNNER_PATH}"
 
@@ -441,17 +470,19 @@ EOF
 }
 
 start_proxy() {
-    local ts_ip
+    local ts_ipv4 ts_ipv6
 
     log '6/7' '正在启动 SOCKS5 代理…'
     systemctl restart "${SERVICE_NAME}.service"
-    ts_ip="$(wait_for_tailscale_ip)" || die '代理启动后未能获取 Tailscale IPv4 地址。'
+    ts_ipv4="$(wait_for_tailscale_ip)" || die '代理启动后未能获取 Tailscale IPv4 地址。'
+    ts_ipv6="$(tailscale ip -6 2>/dev/null | sed -n '1p' || true)"
+    [ -n "${ts_ipv6}" ] || die '代理启动后未能获取 Tailscale IPv6 地址。'
 
     docker ps --format '{{.Names}}' | grep -Fx "${CONTAINER_NAME}" >/dev/null \
         || die '代理容器未处于运行状态，请运行：systemctl status tailscale-socks5.service'
 
     printf '\n部署成功。\n'
-    printf '代理类型: SOCKS5\n代理 IP:   %s\n代理端口: %s\n' "${ts_ip}" "${PROXY_PORT}"
+    printf '代理类型: SOCKS5\n代理 IPv4: %s\n代理 IPv6: %s\n代理端口: %s\n' "${ts_ipv4}" "${ts_ipv6}" "${PROXY_PORT}"
     printf '重启验证: systemctl status %s.service\n' "${SERVICE_NAME}"
 }
 
@@ -465,6 +496,7 @@ main() {
     ensure_tailscale
     connect_tailscale
     ensure_docker
+    ensure_firewall_tools
     write_install_state
     write_runtime_files
     start_proxy

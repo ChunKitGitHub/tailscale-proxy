@@ -33,12 +33,13 @@ require_root() {
 }
 
 ensure_iptables() {
-    command -v iptables >/dev/null 2>&1 && return
+    command -v iptables >/dev/null 2>&1 && command -v ip6tables >/dev/null 2>&1 && return
 
-    log '1/6' '未检测到 iptables，正在安装兼容包…'
+    log '1/6' '未检测到完整的 iptables/ip6tables，正在安装双栈兼容包…'
     opkg update
-    opkg install iptables-nft 2>/dev/null || opkg install iptables
-    command -v iptables >/dev/null 2>&1 || die 'iptables 安装失败；请确认系统软件源可用。'
+    opkg install iptables-nft ip6tables-nft 2>/dev/null || opkg install iptables ip6tables
+    command -v iptables >/dev/null 2>&1 && command -v ip6tables >/dev/null 2>&1 \
+        || die 'iptables/ip6tables 安装失败；请确认系统软件源可用。'
 }
 
 detect_firewall_backend() {
@@ -118,8 +119,8 @@ connect_tailscale() {
         log 'WARN' '当前尚未登录，登录后会再次清除旧路由广播。'
     fi
 
-    if tailscale ip -4 >/dev/null 2>&1; then
-        log '3/6' "Tailscale 已连接，IP: $(tailscale ip -4 | sed -n '1p')"
+    if tailscale ip -4 >/dev/null 2>&1 && tailscale ip -6 >/dev/null 2>&1; then
+        log '3/6' "Tailscale 已连接，IPv4: $(tailscale ip -4 | sed -n '1p')，IPv6: $(tailscale ip -6 | sed -n '1p')"
         if ! should_relogin; then
             log 'INFO' '保留现有 Tailscale 身份。'
             return
@@ -134,7 +135,8 @@ connect_tailscale() {
     tailscale login --auth-key="${TAILSCALE_AUTH_KEY}"
     tailscale set --advertise-routes=
     tailscale ip -4 >/dev/null 2>&1 || die 'Tailscale 未能获取 IPv4 地址，请检查 Auth Key 和网络。'
-    log '3/6' "Tailscale 已连接，IP: $(tailscale ip -4 | sed -n '1p')"
+    tailscale ip -6 >/dev/null 2>&1 || die 'Tailscale 未能获取 IPv6 地址，请检查 Auth Key 和网络。'
+    log '3/6' "Tailscale 已连接，IPv4: $(tailscale ip -4 | sed -n '1p')，IPv6: $(tailscale ip -6 | sed -n '1p')"
 }
 
 write_firewall_script() {
@@ -184,18 +186,22 @@ EOF
 PATH='/usr/sbin:/usr/bin:/sbin:/bin'
 
 ensure_rule() {
-    table="$1"
-    chain="$2"
-    shift 2
-    iptables -t "${table}" -C "${chain}" "$@" 2>/dev/null || \
-        iptables -t "${table}" -I "${chain}" "$@"
+	command="$1"
+	table="$2"
+	chain="$3"
+	shift 3
+	"${command}" -t "${table}" -C "${chain}" "$@" 2>/dev/null || \
+		"${command}" -t "${table}" -I "${chain}" "$@"
 }
 
 # 允许 LAN 客户端经 OpenWrt 转发到 Spot 的 Tailscale 地址；
 # MASQUERADE 保证 Spot 的回包返回本 OpenWrt，再由 conntrack 交还 LAN 客户端。
-ensure_rule filter FORWARD -i tailscale0 -j ACCEPT
-ensure_rule filter FORWARD -o tailscale0 -j ACCEPT
-ensure_rule nat POSTROUTING -o tailscale0 -j MASQUERADE
+ensure_rule iptables filter FORWARD -i tailscale0 -j ACCEPT
+ensure_rule iptables filter FORWARD -o tailscale0 -j ACCEPT
+ensure_rule iptables nat POSTROUTING -o tailscale0 -j MASQUERADE
+ensure_rule ip6tables filter FORWARD -i tailscale0 -j ACCEPT
+ensure_rule ip6tables filter FORWARD -o tailscale0 -j ACCEPT
+ensure_rule ip6tables nat POSTROUTING -o tailscale0 -j MASQUERADE
 EOF
     chmod 0755 "${FIREWALL_SCRIPT}"
 }
@@ -239,7 +245,8 @@ verify() {
             || die 'tailscale0 NAT 规则未生效。'
 
         printf '\n部署完成。\n'
-        printf 'Tailscale IP: %s\n' "$(tailscale ip -4 | sed -n '1p')"
+		printf 'Tailscale IPv4: %s\n' "$(tailscale ip -4 | sed -n '1p')"
+		printf 'Tailscale IPv6: %s\n' "$(tailscale ip -6 | sed -n '1p')"
         printf '重启后规则由 %s 自动恢复。\n' "${FIREWALL_SCRIPT}"
         printf 'Windows 可通过本 OpenWrt 的默认网关，访问已获授权的 Spot Tailscale IP:1080。\n'
         return
@@ -248,9 +255,13 @@ verify() {
     iptables -C FORWARD -i tailscale0 -j ACCEPT || die 'tailscale0 入站转发规则未生效。'
     iptables -C FORWARD -o tailscale0 -j ACCEPT || die 'tailscale0 出站转发规则未生效。'
     iptables -t nat -C POSTROUTING -o tailscale0 -j MASQUERADE || die 'tailscale0 NAT 规则未生效。'
+    ip6tables -C FORWARD -i tailscale0 -j ACCEPT || die 'tailscale0 IPv6 入站转发规则未生效。'
+    ip6tables -C FORWARD -o tailscale0 -j ACCEPT || die 'tailscale0 IPv6 出站转发规则未生效。'
+    ip6tables -t nat -C POSTROUTING -o tailscale0 -j MASQUERADE || die 'tailscale0 IPv6 NAT 规则未生效。'
 
     printf '\n部署完成。\n'
-    printf 'Tailscale IP: %s\n' "$(tailscale ip -4 | sed -n '1p')"
+    printf 'Tailscale IPv4: %s\n' "$(tailscale ip -4 | sed -n '1p')"
+    printf 'Tailscale IPv6: %s\n' "$(tailscale ip -6 | sed -n '1p')"
     printf '重启后规则由 %s 自动恢复。\n' "${FIREWALL_SCRIPT}"
     printf 'Windows 可通过本 OpenWrt 的默认网关，访问已获授权的 Spot Tailscale IP:1080。\n'
 }

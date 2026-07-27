@@ -14,10 +14,13 @@ set -eu
 PATH='/usr/sbin:/usr/bin:/sbin:/bin'
 FIREWALL_SCRIPT='/etc/firewall.tailscale-forwarding'
 LEGACY_NFT_FIREWALL_SCRIPT='/etc/nftables.d/90-tailscale-forwarding.nft'
+MAGICDNS_STATE_FILE='/etc/tailscale-magicdns-domain'
 FIREWALL_INCLUDE='tailscale_forwarding'
 TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}"
 FORCE_TAILSCALE_RELOGIN="${FORCE_TAILSCALE_RELOGIN:-0}"
 FIREWALL_BACKEND=''
+MAGICDNS_SUFFIX=''
+MAGICDNS_SELF_NAME=''
 
 log() {
     printf '[%s] %s\n' "$1" "$2"
@@ -139,6 +142,105 @@ connect_tailscale() {
     log '3/6' "Tailscale 已连接，IPv4: $(tailscale ip -4 | sed -n '1p')，IPv6: $(tailscale ip -6 | sed -n '1p')"
 }
 
+configure_magicdns() {
+    status_json=''
+    suffix=''
+    self_dns_name=''
+    self_host_name=''
+    old_suffix=''
+
+    log 'INFO' '正在配置 OpenWrt 和 LAN 的 Tailscale MagicDNS…'
+    tailscale set --accept-dns=true \
+        || log 'WARN' '无法启用 Tailscale accept-dns，将继续配置 dnsmasq 条件转发。'
+
+    status_json="$(tailscale status --json 2>/dev/null || true)"
+    if command -v jsonfilter >/dev/null 2>&1; then
+        suffix="$(printf '%s' "${status_json}" | jsonfilter -e '@.MagicDNSSuffix' 2>/dev/null || true)"
+        self_dns_name="$(printf '%s' "${status_json}" | jsonfilter -e '@.Self.DNSName' 2>/dev/null || true)"
+        self_host_name="$(printf '%s' "${status_json}" | jsonfilter -e '@.Self.HostName' 2>/dev/null || true)"
+    fi
+    if [ -z "${suffix}" ]; then
+        suffix="$(printf '%s\n' "${status_json}" \
+            | sed -n 's/.*"MagicDNSSuffix"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            | sed -n '1p')"
+    fi
+    if [ -z "${self_dns_name}" ]; then
+        self_dns_name="$(printf '%s\n' "${status_json}" \
+            | sed -n 's/.*"DNSName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            | sed -n '1p')"
+    fi
+    if [ -z "${self_host_name}" ]; then
+        self_host_name="$(printf '%s\n' "${status_json}" \
+            | sed -n 's/.*"HostName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            | sed -n '1p')"
+    fi
+    suffix="${suffix%.}"
+    case "${suffix}" in
+        ''|*[!A-Za-z0-9.-]*)
+            log 'WARN' '未能读取有效的 MagicDNS 后缀；完整域名需要由现有 DNS 配置解析。'
+            return
+            ;;
+    esac
+    self_dns_name="${self_dns_name%.}"
+    if [ -z "${self_dns_name}" ] && [ -n "${self_host_name}" ]; then
+        self_dns_name="${self_host_name%.}.${suffix}"
+    fi
+    MAGICDNS_SUFFIX="${suffix}"
+    MAGICDNS_SELF_NAME="${self_dns_name}"
+
+    [ -x /etc/init.d/dnsmasq ] || {
+        log 'WARN' '未检测到 dnsmasq，跳过 LAN MagicDNS 转发配置。'
+        return
+    }
+    if [ -f "${MAGICDNS_STATE_FILE}" ]; then
+        old_suffix="$(sed -n '1p' "${MAGICDNS_STATE_FILE}")"
+    fi
+    if [ -n "${old_suffix}" ]; then
+        uci -q del_list "dhcp.@dnsmasq[0].server=/${old_suffix}/100.100.100.100" || true
+        uci -q del_list "dhcp.@dnsmasq[0].rebind_domain=${old_suffix}" || true
+        uci -q del_list "dhcp.@dnsmasq[0].rebind_domain=/${old_suffix}/" || true
+        if [ "$(uci -q get dhcp.lan 2>/dev/null || true)" = 'dhcp' ]; then
+            uci -q del_list "dhcp.lan.dhcp_option=15,${old_suffix}" || true
+            uci -q del_list "dhcp.lan.dhcp_option=119,${old_suffix}" || true
+        fi
+    fi
+
+    uci -q del_list "dhcp.@dnsmasq[0].server=/${suffix}/100.100.100.100" || true
+    uci add_list "dhcp.@dnsmasq[0].server=/${suffix}/100.100.100.100"
+    uci -q del_list "dhcp.@dnsmasq[0].rebind_domain=${suffix}" || true
+    uci -q del_list "dhcp.@dnsmasq[0].rebind_domain=/${suffix}/" || true
+    uci add_list "dhcp.@dnsmasq[0].rebind_domain=/${suffix}/"
+    if [ "$(uci -q get dhcp.lan 2>/dev/null || true)" = 'dhcp' ]; then
+        uci -q del_list "dhcp.lan.dhcp_option=15,${suffix}" || true
+        uci add_list "dhcp.lan.dhcp_option=15,${suffix}"
+        uci -q del_list "dhcp.lan.dhcp_option=119,${suffix}" || true
+        uci add_list "dhcp.lan.dhcp_option=119,${suffix}"
+    fi
+    uci commit dhcp
+    printf '%s\n' "${suffix}" >"${MAGICDNS_STATE_FILE}"
+    chmod 0600 "${MAGICDNS_STATE_FILE}"
+    /etc/init.d/dnsmasq restart
+    log 'INFO' "MagicDNS 已转发到 100.100.100.100，域名后缀：${suffix}"
+    log 'INFO' 'LAN 客户端需重新获取 DHCP 租约后，才会取得短名称搜索后缀。'
+}
+
+verify_magicdns() {
+    [ -n "${MAGICDNS_SUFFIX}" ] || return
+    command -v nslookup >/dev/null 2>&1 || {
+        log 'WARN' '未找到 nslookup，无法自动验证 MagicDNS；请手动查询完整域名。'
+        return
+    }
+    [ -n "${MAGICDNS_SELF_NAME}" ] || die 'MagicDNS 已写入 dnsmasq，但无法读取本机完整 DNS 名称进行验证。'
+
+    expected_ipv4="$(tailscale ip -4 | sed -n '1p')"
+    lookup_result="$(nslookup "${MAGICDNS_SELF_NAME}" 127.0.0.1 2>&1 || true)"
+    if ! printf '%s\n' "${lookup_result}" | grep -F "${expected_ipv4}" >/dev/null; then
+        printf '%s\n' "${lookup_result}" >&2
+        die "MagicDNS 验证失败：dnsmasq 无法将 ${MAGICDNS_SELF_NAME} 解析到 ${expected_ipv4}。请检查 dhcp.@dnsmasq[0].server 和 100.100.100.100。"
+    fi
+    log 'INFO' "MagicDNS 验证通过：${MAGICDNS_SELF_NAME} -> ${expected_ipv4}"
+}
+
 write_firewall_script() {
     log '4/6' '正在写入持久化 Tailscale 转发规则…'
     # 清理早期版本写入的错误 nftables include；fw4 会自动加载
@@ -238,6 +340,7 @@ apply_firewall_rules() {
 
 verify() {
     log '6/6' '正在验证…'
+    verify_magicdns
     if [ "${FIREWALL_BACKEND}" = 'nft' ]; then
         nft list chain inet fw4 forward | grep -F 'tailscale0' >/dev/null \
             || die 'tailscale0 转发规则未生效。'
@@ -273,6 +376,7 @@ main() {
     ensure_tailscale
     update_tailscale
     connect_tailscale
+    configure_magicdns
     write_firewall_script
     configure_firewall_include
     apply_firewall_rules

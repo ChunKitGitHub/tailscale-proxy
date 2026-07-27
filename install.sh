@@ -373,7 +373,6 @@ install_heartbeat_agent() {
         printf 'REGISTRY_WS_URL=%s\n' "${REGISTRY_URL}"
         printf 'REGISTRY_AGENT_TOKEN=%s\n' "${REGISTRY_AGENT_TOKEN}"
         printf 'PROXY_PORT=%s\n' "${PROXY_PORT}"
-        printf 'TAILSCALE_HOSTNAME=%s\n' "${TAILSCALE_HOSTNAME}"
         printf 'HEARTBEAT_INTERVAL=%s\n' "${HEARTBEAT_INTERVAL}"
     } >"${HEARTBEAT_CONFIG_FILE}"
     chmod 0600 "${HEARTBEAT_CONFIG_FILE}"
@@ -437,14 +436,34 @@ done
 [ -n "${TS_IPV4:-}" ] && [ -n "${TS_IPV6:-}" ] \
     || { echo 'Tailscale IPv4 and IPv6 addresses were not available after 120 seconds' >&2; exit 1; }
 
+# Each listener has its own strict resolver and wildcard source address. This
+# keeps the outbound family equal to the Tailscale address family selected by
+# the client: IPv4 listener -> IPv4 egress, IPv6 listener -> IPv6 egress.
+SYSTEM_DNS_IP="$(sed -n 's/^nameserver[[:space:]][[:space:]]*//p' /etc/resolv.conf | sed -n '1p')"
+case "${SYSTEM_DNS_IP}" in
+    '') SYSTEM_DNS_SERVER='8.8.8.8:53' ;;
+    *:*) SYSTEM_DNS_SERVER="[${SYSTEM_DNS_IP}]:53" ;;
+    *) SYSTEM_DNS_SERVER="${SYSTEM_DNS_IP}:53" ;;
+esac
+GOST_CONFIG="$(printf '%s\n' \
+    '{' \
+    '  "services": [' \
+    "    {\"name\":\"socks-ipv4\",\"addr\":\"${TS_IPV4}:${PROXY_PORT}\",\"resolver\":\"resolver-ipv4\",\"metadata\":{\"interface\":\"0.0.0.0\"},\"handler\":{\"type\":\"socks5\"},\"listener\":{\"type\":\"tcp\"}}," \
+    "    {\"name\":\"socks-ipv6\",\"addr\":\"[${TS_IPV6}]:${PROXY_PORT}\",\"resolver\":\"resolver-ipv6\",\"metadata\":{\"interface\":\"::\"},\"handler\":{\"type\":\"socks5\"},\"listener\":{\"type\":\"tcp\"}}" \
+    '  ],' \
+    '  "resolvers": [' \
+    "    {\"name\":\"resolver-ipv4\",\"nameservers\":[{\"addr\":\"${SYSTEM_DNS_SERVER}\",\"only\":\"ipv4\"},{\"addr\":\"8.8.8.8:53\",\"only\":\"ipv4\"},{\"addr\":\"1.1.1.1:53\",\"only\":\"ipv4\"}]}," \
+    "    {\"name\":\"resolver-ipv6\",\"nameservers\":[{\"addr\":\"${SYSTEM_DNS_SERVER}\",\"only\":\"ipv6\"},{\"addr\":\"8.8.8.8:53\",\"only\":\"ipv6\"},{\"addr\":\"1.1.1.1:53\",\"only\":\"ipv6\"}]}" \
+    '  ]' \
+    '}')"
+
 docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
 exec docker run -d \
     --name "${CONTAINER_NAME}" \
     --restart unless-stopped \
     --network host \
     "${GOST_IMAGE}" \
-    -L="socks5://${TS_IPV4}:${PROXY_PORT}" \
-    -L="socks5://[${TS_IPV6}]:${PROXY_PORT}"
+    -C="${GOST_CONFIG}"
 EOF
     chmod 0755 "${RUNNER_PATH}"
 

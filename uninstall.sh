@@ -67,6 +67,18 @@ remove_heartbeat_service() {
     if command -v systemctl >/dev/null 2>&1; then
         systemctl disable --now "${HEARTBEAT_SERVICE}.service" >/dev/null 2>&1 || true
     fi
+    if [ -x "${HEARTBEAT_RUNNER_PATH}" ]; then
+        local proxy_ipv4_port='1080'
+        local proxy_ipv6_port='1081'
+        if [ -f "${CONFIG_DIR}/heartbeat.env" ]; then
+            proxy_ipv4_port="$(sed -n 's/^PROXY_IPV4_PORT=//p' "${CONFIG_DIR}/heartbeat.env" | sed -n '1p')"
+            proxy_ipv6_port="$(sed -n 's/^PROXY_IPV6_PORT=//p' "${CONFIG_DIR}/heartbeat.env" | sed -n '1p')"
+            [ -n "${proxy_ipv4_port}" ] || proxy_ipv4_port='1080'
+            [ -n "${proxy_ipv6_port}" ] || proxy_ipv6_port='1081'
+        fi
+        PROXY_IPV4_PORT="${proxy_ipv4_port}" PROXY_IPV6_PORT="${proxy_ipv6_port}" \
+            "${HEARTBEAT_RUNNER_PATH}" --cleanup-access-control || true
+    fi
     rm -f "${HEARTBEAT_UNIT_PATH}" "${HEARTBEAT_RUNNER_PATH}"
     if command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload

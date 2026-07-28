@@ -11,7 +11,8 @@ set -Eeuo pipefail
 
 # 可通过环境变量覆盖，不要把 Auth Key 写回此文件或提交到仓库。
 TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}"
-PROXY_PORT="${PROXY_PORT:-1080}"
+PROXY_IPV4_PORT="${PROXY_IPV4_PORT:-1080}"
+PROXY_IPV6_PORT="${PROXY_IPV6_PORT:-1081}"
 GOST_IMAGE="${GOST_IMAGE:-gogost/gost}"
 CONTAINER_NAME="${CONTAINER_NAME:-proxy_socks5}"
 # 留空时自动读取 GCP 实例名；也可通过环境变量显式覆盖。
@@ -56,10 +57,13 @@ require_root() {
 }
 
 validate_config() {
-    case "${PROXY_PORT}" in
-        ''|*[!0-9]*) die "PROXY_PORT 必须是 1 到 65535 之间的数字" ;;
-    esac
-    (( PROXY_PORT >= 1 && PROXY_PORT <= 65535 )) || die "PROXY_PORT 必须是 1 到 65535 之间的数字"
+    for proxy_port in "${PROXY_IPV4_PORT}" "${PROXY_IPV6_PORT}"; do
+        case "${proxy_port}" in
+            ''|*[!0-9]*) die "PROXY_IPV4_PORT 和 PROXY_IPV6_PORT 必须是 1 到 65535 之间的数字" ;;
+        esac
+        (( proxy_port >= 1 && proxy_port <= 65535 )) || die "PROXY_IPV4_PORT 和 PROXY_IPV6_PORT 必须是 1 到 65535 之间的数字"
+    done
+    [ "${PROXY_IPV4_PORT}" != "${PROXY_IPV6_PORT}" ] || die 'PROXY_IPV4_PORT 和 PROXY_IPV6_PORT 必须使用不同端口。'
     [ -n "${GOST_IMAGE}" ] || die "GOST_IMAGE 不能为空"
     [ -n "${CONTAINER_NAME}" ] || die "CONTAINER_NAME 不能为空"
     if [ -n "${TAILSCALE_HOSTNAME}" ]; then
@@ -372,7 +376,8 @@ install_heartbeat_agent() {
     {
         printf 'REGISTRY_WS_URL=%s\n' "${REGISTRY_URL}"
         printf 'REGISTRY_AGENT_TOKEN=%s\n' "${REGISTRY_AGENT_TOKEN}"
-        printf 'PROXY_PORT=%s\n' "${PROXY_PORT}"
+        printf 'PROXY_IPV4_PORT=%s\n' "${PROXY_IPV4_PORT}"
+        printf 'PROXY_IPV6_PORT=%s\n' "${PROXY_IPV6_PORT}"
         printf 'HEARTBEAT_INTERVAL=%s\n' "${HEARTBEAT_INTERVAL}"
     } >"${HEARTBEAT_CONFIG_FILE}"
     chmod 0600 "${HEARTBEAT_CONFIG_FILE}"
@@ -406,7 +411,8 @@ write_runtime_files() {
     # %q 让 config 即使包含空格等字符也能被 bash 安全地 source。
     {
         printf '# 由 install.sh 生成；可修改端口或镜像后重新运行 install.sh。\n'
-        printf 'PROXY_PORT=%q\n' "${PROXY_PORT}"
+        printf 'PROXY_IPV4_PORT=%q\n' "${PROXY_IPV4_PORT}"
+        printf 'PROXY_IPV6_PORT=%q\n' "${PROXY_IPV6_PORT}"
         printf 'GOST_IMAGE=%q\n' "${GOST_IMAGE}"
         printf 'CONTAINER_NAME=%q\n' "${CONTAINER_NAME}"
     } >"${CONFIG_FILE}"
@@ -420,10 +426,13 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 CONFIG_FILE=/etc/tailscale-socks5/config
 source "${CONFIG_FILE}"
 
-case "${PROXY_PORT}" in
-    ''|*[!0-9]*) echo 'Invalid PROXY_PORT' >&2; exit 1 ;;
-esac
-(( PROXY_PORT >= 1 && PROXY_PORT <= 65535 )) || { echo 'Invalid PROXY_PORT' >&2; exit 1; }
+for PROXY_PORT in "${PROXY_IPV4_PORT}" "${PROXY_IPV6_PORT}"; do
+    case "${PROXY_PORT}" in
+        ''|*[!0-9]*) echo 'Invalid proxy port' >&2; exit 1 ;;
+    esac
+    (( PROXY_PORT >= 1 && PROXY_PORT <= 65535 )) || { echo 'Invalid proxy port' >&2; exit 1; }
+done
+[ "${PROXY_IPV4_PORT}" != "${PROXY_IPV6_PORT}" ] || { echo 'Proxy ports must differ' >&2; exit 1; }
 
 # Docker 会在 Tailscale 网络真正就绪前先尝试恢复旧容器；这里显式等待 IP，
 # 再重建容器，避免 "cannot assign requested address" 后永远无法监听的问题。
@@ -436,9 +445,9 @@ done
 [ -n "${TS_IPV4:-}" ] && [ -n "${TS_IPV6:-}" ] \
     || { echo 'Tailscale IPv4 and IPv6 addresses were not available after 120 seconds' >&2; exit 1; }
 
-# Each listener has its own strict resolver and wildcard source address. This
-# keeps the outbound family equal to the Tailscale address family selected by
-# the client: IPv4 listener -> IPv4 egress, IPv6 listener -> IPv6 egress.
+# Both listeners bind the Spot's Tailscale IPv4 address. 1080 always uses an
+# IPv4 resolver/source address, while 1081 always uses IPv6. LAN clients never
+# need Tailscale IPv6 routing.
 SYSTEM_DNS_IP="$(sed -n 's/^nameserver[[:space:]][[:space:]]*//p' /etc/resolv.conf | sed -n '1p')"
 case "${SYSTEM_DNS_IP}" in
     '') SYSTEM_DNS_SERVER='8.8.8.8:53' ;;
@@ -448,8 +457,8 @@ esac
 GOST_CONFIG="$(printf '%s\n' \
     '{' \
     '  "services": [' \
-    "    {\"name\":\"socks-ipv4\",\"addr\":\"${TS_IPV4}:${PROXY_PORT}\",\"resolver\":\"resolver-ipv4\",\"metadata\":{\"interface\":\"0.0.0.0\"},\"handler\":{\"type\":\"socks5\"},\"listener\":{\"type\":\"tcp\"}}," \
-    "    {\"name\":\"socks-ipv6\",\"addr\":\"[${TS_IPV6}]:${PROXY_PORT}\",\"resolver\":\"resolver-ipv6\",\"metadata\":{\"interface\":\"::\"},\"handler\":{\"type\":\"socks5\"},\"listener\":{\"type\":\"tcp\"}}" \
+    "    {\"name\":\"socks-ipv4-egress\",\"addr\":\"${TS_IPV4}:${PROXY_IPV4_PORT}\",\"resolver\":\"resolver-ipv4\",\"metadata\":{\"interface\":\"0.0.0.0\"},\"handler\":{\"type\":\"socks5\"},\"listener\":{\"type\":\"tcp\"}}," \
+    "    {\"name\":\"socks-ipv6-egress\",\"addr\":\"${TS_IPV4}:${PROXY_IPV6_PORT}\",\"resolver\":\"resolver-ipv6\",\"metadata\":{\"interface\":\"::\"},\"handler\":{\"type\":\"socks5\"},\"listener\":{\"type\":\"tcp\"}}" \
     '  ],' \
     '  "resolvers": [' \
     "    {\"name\":\"resolver-ipv4\",\"nameservers\":[{\"addr\":\"${SYSTEM_DNS_SERVER}\",\"only\":\"ipv4\"},{\"addr\":\"8.8.8.8:53\",\"only\":\"ipv4\"},{\"addr\":\"1.1.1.1:53\",\"only\":\"ipv4\"}]}," \
@@ -489,19 +498,17 @@ EOF
 }
 
 start_proxy() {
-    local ts_ipv4 ts_ipv6
+    local ts_ipv4
 
     log '6/7' '正在启动 SOCKS5 代理…'
     systemctl restart "${SERVICE_NAME}.service"
     ts_ipv4="$(wait_for_tailscale_ip)" || die '代理启动后未能获取 Tailscale IPv4 地址。'
-    ts_ipv6="$(tailscale ip -6 2>/dev/null | sed -n '1p' || true)"
-    [ -n "${ts_ipv6}" ] || die '代理启动后未能获取 Tailscale IPv6 地址。'
 
     docker ps --format '{{.Names}}' | grep -Fx "${CONTAINER_NAME}" >/dev/null \
         || die '代理容器未处于运行状态，请运行：systemctl status tailscale-socks5.service'
 
     printf '\n部署成功。\n'
-    printf '代理类型: SOCKS5\n代理 IPv4: %s\n代理 IPv6: %s\n代理端口: %s\n' "${ts_ipv4}" "${ts_ipv6}" "${PROXY_PORT}"
+    printf '代理类型: SOCKS5\nIPv4 出口: %s:%s\nIPv6 出口: %s:%s\n' "${ts_ipv4}" "${PROXY_IPV4_PORT}" "${ts_ipv4}" "${PROXY_IPV6_PORT}"
     printf '重启验证: systemctl status %s.service\n' "${SERVICE_NAME}"
 }
 

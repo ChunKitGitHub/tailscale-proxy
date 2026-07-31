@@ -4,7 +4,12 @@
 # 功能：
 #   1. 安装并开机启动 Tailscale；
 #   2. 首次运行时从终端读取 Auth Key（不写入文件）；
-#   3. 持久化 LAN <-> tailscale0 转发及 tailscale0 NAT 规则。
+#   3. 持久化 LAN <-> tailscale0 转发、tailscale0 入站放行及 NAT 规则；
+#   4. 广播 LAN 子网路由（TAILSCALE_ADVERTISE_ROUTES 可覆盖，设为 none 关闭；
+#      改动后需在 Tailscale 管理后台批准）；
+#   5. 检测到 PassWall 时写入兼容配置：关闭"路由器本机代理"（否则 tailscaled
+#      的 STUN/DERP/WireGuard UDP 会被 TPROXY 进代理，DERP 误选美国）、
+#      排除 LAN 客户端的 UDP 3478/41641、控制面域名加入直连列表。
 #
 # 不会广播 100.64.0.0/10。Windows 等未安装 Tailscale 的 LAN 客户端，
 # 通过本机默认网关/静态路由和 NAT 访问 Spot 的 Tailscale IP。
@@ -17,6 +22,7 @@ LEGACY_NFT_FIREWALL_SCRIPT='/etc/nftables.d/90-tailscale-forwarding.nft'
 MAGICDNS_STATE_FILE='/etc/tailscale-magicdns-domain'
 FIREWALL_INCLUDE='tailscale_forwarding'
 TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}"
+TAILSCALE_ADVERTISE_ROUTES="${TAILSCALE_ADVERTISE_ROUTES:-auto}"
 FORCE_TAILSCALE_RELOGIN="${FORCE_TAILSCALE_RELOGIN:-0}"
 FIREWALL_BACKEND=''
 MAGICDNS_SUFFIX=''
@@ -115,13 +121,6 @@ should_relogin() {
 }
 
 connect_tailscale() {
-    # 清除旧教程遗留的错误路由广播。tailscale set 只修改这一项偏好，
-    # 不需要 --reset，也不会覆盖用户其他 Tailscale 设置。
-    log '3/6' '正在清除旧的 100.64.0.0/10 路由广播（如存在）…'
-    if ! tailscale set --advertise-routes=; then
-        log 'WARN' '当前尚未登录，登录后会再次清除旧路由广播。'
-    fi
-
     if tailscale ip -4 >/dev/null 2>&1 && tailscale ip -6 >/dev/null 2>&1; then
         log '3/6' "Tailscale 已连接，IPv4: $(tailscale ip -4 | sed -n '1p')，IPv6: $(tailscale ip -6 | sed -n '1p')"
         if ! should_relogin; then
@@ -136,10 +135,31 @@ connect_tailscale() {
     log '3/6' '正在加入 Tailscale…'
     # login 仅处理身份认证，不会要求把旧 hostname、路由等所有偏好重新列出。
     tailscale login --auth-key="${TAILSCALE_AUTH_KEY}"
-    tailscale set --advertise-routes=
     tailscale ip -4 >/dev/null 2>&1 || die 'Tailscale 未能获取 IPv4 地址，请检查 Auth Key 和网络。'
     tailscale ip -6 >/dev/null 2>&1 || die 'Tailscale 未能获取 IPv6 地址，请检查 Auth Key 和网络。'
     log '3/6' "Tailscale 已连接，IPv4: $(tailscale ip -4 | sed -n '1p')，IPv6: $(tailscale ip -6 | sed -n '1p')"
+}
+
+configure_routes() {
+    # 广播 LAN 子网路由，让 tailnet 内其他设备能访问家里局域网。
+    # tailscale set 会整体覆盖路由列表，同时清掉旧教程遗留的 100.64.0.0/10。
+    # TAILSCALE_ADVERTISE_ROUTES=none 跳过；auto（默认）自动探测 br-lan 网段。
+    routes="${TAILSCALE_ADVERTISE_ROUTES}"
+    if [ "${routes}" = 'auto' ]; then
+        routes="$(ip -4 route show dev br-lan proto kernel 2>/dev/null \
+            | awk '$1 ~ /\// { print $1; exit }')"
+        [ -n "${routes}" ] || {
+            log 'WARN' '未能探测到 br-lan 子网，跳过子网路由广播。'
+            return
+        }
+    fi
+    if [ "${routes}" = 'none' ]; then
+        log 'INFO' '按配置跳过子网路由广播。'
+        return
+    fi
+    tailscale set --advertise-routes="${routes}" \
+        || die "广播子网路由 ${routes} 失败。"
+    log 'INFO' "已广播子网路由：${routes}（首次需在 Tailscale 管理后台批准）。"
 }
 
 configure_magicdns() {
@@ -273,6 +293,9 @@ replace_nft_rule() {
 
 # 允许 LAN 客户端经 OpenWrt 转发到 Spot 的 Tailscale 地址；
 # MASQUERADE 保证 Spot 的回包返回本 OpenWrt，再由 conntrack 交还 LAN 客户端。
+# input 放行是必需的：fw4 input 链默认 policy drop，tailscale 自己表里的
+# accept 拦不住 fw4 的 reject，缺了这条就无法从 tailnet 访问 OpenWrt 本机。
+replace_nft_rule insert input tailscale-input iifname '"tailscale0"' accept
 replace_nft_rule insert forward tailscale-forward-in iifname '"tailscale0"' accept
 replace_nft_rule insert forward tailscale-forward-out oifname '"tailscale0"' accept
 replace_nft_rule add srcnat tailscale-srcnat oifname '"tailscale0"' masquerade
@@ -298,9 +321,12 @@ ensure_rule() {
 
 # 允许 LAN 客户端经 OpenWrt 转发到 Spot 的 Tailscale 地址；
 # MASQUERADE 保证 Spot 的回包返回本 OpenWrt，再由 conntrack 交还 LAN 客户端。
+# INPUT 放行保证可以从 tailnet 访问 OpenWrt 本机（LuCI/SSH）。
+ensure_rule iptables filter INPUT -i tailscale0 -j ACCEPT
 ensure_rule iptables filter FORWARD -i tailscale0 -j ACCEPT
 ensure_rule iptables filter FORWARD -o tailscale0 -j ACCEPT
 ensure_rule iptables nat POSTROUTING -o tailscale0 -j MASQUERADE
+ensure_rule ip6tables filter INPUT -i tailscale0 -j ACCEPT
 ensure_rule ip6tables filter FORWARD -i tailscale0 -j ACCEPT
 ensure_rule ip6tables filter FORWARD -o tailscale0 -j ACCEPT
 ensure_rule ip6tables nat POSTROUTING -o tailscale0 -j MASQUERADE
@@ -338,15 +364,77 @@ apply_firewall_rules() {
     "${FIREWALL_SCRIPT}"
 }
 
+configure_passwall_compat() {
+    # PassWall 与 Tailscale 共存的三处必要排除，全部幂等：
+    #   1. 关闭"路由器本机代理"。PassWall 的 PSW_RULE 会用 ct mark 覆盖
+    #      tailscaled 的 0x80000 逃逸标记再 TPROXY，导致 STUN/DERP/WireGuard
+    #      全部绕道代理出口（DERP 误选美国、NAT 探测抖动）。DERP 地址表内嵌
+    #      IP 不走 DNS，直连域名列表拦不住，只能关本机代理；LAN 客户端翻墙
+    #      走的是 client_proxy（PREROUTING 链），不受影响。
+    #   2. UDP 不转发端口加 3478/41641，豁免 LAN 上 Tailscale 客户端
+    #      （Mac/iPhone 等）的 STUN 探测与 WireGuard 直连。
+    #   3. 控制面域名加直连列表（对 controlplane 的 TCP 443 有效）。
+    uci -q get passwall.@global[0] >/dev/null 2>&1 || return 0
+    log 'INFO' '检测到 PassWall，正在检查 Tailscale 兼容配置…'
+    changed=0
+
+    if [ "$(uci -q get passwall.@global[0].localhost_proxy || echo '1')" != '0' ]; then
+        uci set passwall.@global[0].localhost_proxy='0'
+        changed=1
+        log 'INFO' '已关闭 PassWall 路由器本机代理（不影响 LAN 客户端代理）。'
+    fi
+
+    current="$(uci -q get passwall.@global_forwarding[0].udp_no_redir_ports || true)"
+    wanted="${current}"
+    case "${wanted}" in
+        ''|disable) wanted='3478,41641' ;;
+    esac
+    case ",${wanted}," in
+        *,3478,*) ;;
+        *) wanted="${wanted},3478" ;;
+    esac
+    case ",${wanted}," in
+        *,41641,*) ;;
+        *) wanted="${wanted},41641" ;;
+    esac
+    if [ "${wanted}" != "${current}" ]; then
+        uci set passwall.@global_forwarding[0].udp_no_redir_ports="${wanted}"
+        changed=1
+        log 'INFO' "PassWall UDP 不转发端口已设为：${wanted}"
+    fi
+
+    direct_host='/usr/share/passwall/rules/direct_host'
+    if [ -f "${direct_host}" ]; then
+        for domain in tailscale.com ts.net; do
+            if ! grep -qx "${domain}" "${direct_host}"; then
+                printf '%s\n' "${domain}" >>"${direct_host}"
+                changed=1
+                log 'INFO' "已将 ${domain} 加入 PassWall 直连域名列表。"
+            fi
+        done
+    fi
+
+    if [ "${changed}" = '1' ]; then
+        uci commit passwall
+        /etc/init.d/passwall restart
+        # 让 tailscaled 丢弃经代理测得的 DERP 延迟，重新探测。
+        /etc/init.d/tailscale restart
+        log 'INFO' 'PassWall 兼容配置已应用，PassWall 与 Tailscale 已重启。'
+    else
+        log 'INFO' 'PassWall 兼容配置已就绪，无需修改。'
+    fi
+}
+
 verify() {
     log '6/6' '正在验证…'
     verify_magicdns
     if [ "${FIREWALL_BACKEND}" = 'nft' ]; then
+        nft list chain inet fw4 input | grep -F 'tailscale0' >/dev/null \
+            || die 'tailscale0 入站放行规则未生效。'
         nft list chain inet fw4 forward | grep -F 'tailscale0' >/dev/null \
             || die 'tailscale0 转发规则未生效。'
         nft list chain inet fw4 srcnat | grep -F 'tailscale0' >/dev/null \
             || die 'tailscale0 NAT 规则未生效。'
-
         printf '\n部署完成。\n'
 		printf 'Tailscale IPv4: %s\n' "$(tailscale ip -4 | sed -n '1p')"
 		printf 'Tailscale IPv6: %s\n' "$(tailscale ip -6 | sed -n '1p')"
@@ -355,6 +443,7 @@ verify() {
         return
     fi
 
+    iptables -C INPUT -i tailscale0 -j ACCEPT || die 'tailscale0 入站放行规则未生效。'
     iptables -C FORWARD -i tailscale0 -j ACCEPT || die 'tailscale0 入站转发规则未生效。'
     iptables -C FORWARD -o tailscale0 -j ACCEPT || die 'tailscale0 出站转发规则未生效。'
     iptables -t nat -C POSTROUTING -o tailscale0 -j MASQUERADE || die 'tailscale0 NAT 规则未生效。'
@@ -376,10 +465,12 @@ main() {
     ensure_tailscale
     update_tailscale
     connect_tailscale
+    configure_routes
     configure_magicdns
     write_firewall_script
     configure_firewall_include
     apply_firewall_rules
+    configure_passwall_compat
     verify
 }
 
